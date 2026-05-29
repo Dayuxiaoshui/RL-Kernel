@@ -12,6 +12,16 @@ except ImportError:
     ROCMExtension = None
 
 
+def _cuda_define_from_env(name: str, macro: str) -> list[str]:
+    value = os.environ.get(name)
+    if value is None:
+        return []
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return [f"-D{macro}={parsed}"]
+
+
 def get_extensions():
     extensions = []
     is_rocm = torch.version.hip is not None
@@ -38,12 +48,60 @@ def get_extensions():
 
         cc_major, _ = torch.cuda.get_device_capability()
         nvcc_flags = ["-O3", "--use_fast_math", "-Xfatbin", "-compress-all"]
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_TWOPASS_BLOCK_SIZE",
+                "FUSED_LOGP_TWOPASS_BLOCK_SIZE",
+            )
+        )
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_ONLINE_BLOCK_SIZE",
+                "FUSED_LOGP_ONLINE_BLOCK_SIZE",
+            )
+        )
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_ONLINE_SPARSE_LARGE_VOCAB_BLOCK_SIZE",
+                "FUSED_LOGP_ONLINE_SPARSE_LARGE_VOCAB_BLOCK_SIZE",
+            )
+        )
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_ONLINE_LARGE_ROW_BYTES_THRESHOLD",
+                "FUSED_LOGP_ONLINE_LARGE_ROW_BYTES_THRESHOLD",
+            )
+        )
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_ONLINE_SPARSE_DENSITY_NUMERATOR",
+                "FUSED_LOGP_ONLINE_SPARSE_DENSITY_NUMERATOR",
+            )
+        )
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_ONLINE_SPARSE_DENSITY_DENOMINATOR",
+                "FUSED_LOGP_ONLINE_SPARSE_DENSITY_DENOMINATOR",
+            )
+        )
+        nvcc_flags.extend(
+            _cuda_define_from_env(
+                "FUSED_LOGP_ONLINE_MIN_BLOCKS_PER_SM",
+                "FUSED_LOGP_ONLINE_MIN_BLOCKS_PER_SM",
+            )
+        )
+        if os.environ.get("KERNEL_ALIGN_NCU_LINEINFO") == "1":
+            nvcc_flags.append("-lineinfo")
+
+        cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
         extra_link_args = []
 
         tma_src = "csrc/cuda/fused_logp_sm90.cu"
-        if cc_major >= 9 or os.path.exists(tma_src):
+        enable_sm90 = cc_major >= 9 or os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
+        if enable_sm90 and os.path.exists(tma_src):
             cuda_sources.append(tma_src)
             nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+            cxx_flags.append("-DKERNEL_ALIGN_WITH_SM90")
             extra_link_args.append("-lcuda")
 
         extensions.append(
@@ -51,7 +109,7 @@ def get_extensions():
                 name="rl_engine._C",
                 sources=cuda_sources,
                 extra_compile_args={
-                    "cxx": ["-O3", "-std=c++17"],
+                    "cxx": cxx_flags,
                     "nvcc": nvcc_flags,
                 },
                 extra_link_args=extra_link_args,
