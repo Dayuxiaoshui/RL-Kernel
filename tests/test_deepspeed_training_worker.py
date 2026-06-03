@@ -224,6 +224,62 @@ def test_deepspeed_training_worker_uses_engine_backward_and_step(monkeypatch):
     assert math.isfinite(result.metrics["loss"])
 
 
+def test_deepspeed_training_worker_uses_payload_grpo_inputs(monkeypatch):
+    _install_fake_deepspeed(monkeypatch)
+    from rl_engine.executors.deepspeed_trainer import (
+        DeepSpeedTrainingConfig,
+        DeepSpeedTrainingWorker,
+    )
+
+    worker = DeepSpeedTrainingWorker(
+        DeepSpeedTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=29,
+            require_payload_rewards=True,
+            require_payload_logps=True,
+        )
+    )
+    result = worker.train(
+        RolloutStageResult(
+            iteration=0,
+            weight_version=4,
+            payload={
+                "normalized_outputs": [
+                    [
+                        {
+                            "token_ids": [1, 2],
+                            "reward": 1.0,
+                            "old_logps": [-0.2, -0.3],
+                            "ref_logps": [-0.4, -0.5],
+                        },
+                        {
+                            "token_ids": [3, 4],
+                            "reward": 3.0,
+                            "old_logps": [-1.0, -1.1],
+                            "ref_logps": [-0.8, -0.9],
+                        },
+                    ]
+                ]
+            },
+            started_at=time.perf_counter(),
+            finished_at=time.perf_counter(),
+        )
+    )
+
+    assert result.metrics["training_backend"] == "deepspeed"
+    assert result.metrics["training_data_source"] == "rollout_payload"
+    assert result.metrics["reward_source"] == "payload_rewards"
+    assert result.metrics["logprob_source"] == "payload_logps"
+    assert result.metrics["objective"] == "grpo"
+    assert math.isfinite(result.metrics["loss"])
+
+
 def test_deepspeed_training_worker_synthetic_fallback(monkeypatch):
     _install_fake_deepspeed(monkeypatch)
     from rl_engine.executors.deepspeed_trainer import (

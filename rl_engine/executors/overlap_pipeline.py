@@ -17,13 +17,9 @@ from rl_engine.executors.training_contract import (
     RolloutStageResult,
     TorchRLTrainingConfig,
     TrainingStageResult,
+    compute_training_grpo_objective,
+    extract_rollout_candidate_groups,
     extract_rollout_token_groups,
-)
-from rl_engine.testing import (
-    compute_policy_ratio,
-    compute_reference_kl,
-    masked_mean,
-    selected_logprobs_reference,
 )
 
 
@@ -534,20 +530,8 @@ class TorchRLTrainingWorker(RolloutBatchMixin):
         batch, payload_metrics = self._batch_from_rollout_or_synthetic(rollout)
 
         logits = self.model(batch.token_ids.long())
-        current_logps = selected_logprobs_reference(
-            logits,
-            batch.token_ids,
-            mask=batch.completion_mask,
-            output_dtype=torch.float32,
-        )
-        old_logps = current_logps.detach() - 0.01
-        ref_logps = current_logps.detach() - 0.02
-        ratio = compute_policy_ratio(current_logps, old_logps, batch.completion_mask)
-        unclipped = ratio * batch.advantages.float()
-        clipped = torch.clamp(ratio, 0.8, 1.2) * batch.advantages.float()
-        policy_loss = -torch.minimum(unclipped, clipped)
-        kl = compute_reference_kl(current_logps, ref_logps, batch.completion_mask)
-        loss = masked_mean(policy_loss + 0.01 * kl, batch.completion_mask)
+        objective = compute_training_grpo_objective(logits, batch, self.config)
+        loss = objective.loss
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -564,6 +548,8 @@ class TorchRLTrainingWorker(RolloutBatchMixin):
                 "active_tokens": int(batch.completion_mask.sum().item()),
                 "payload_type": type(rollout.payload).__name__,
                 "training_backend": "torch",
+                "objective": "grpo",
+                **objective.metrics,
                 **payload_metrics,
             },
             started_at=started_at,
@@ -655,6 +641,7 @@ __all__ = [
     "TrainingWorker",
     "WeightHandoffRecord",
     "compute_stage_overlap_seconds",
+    "extract_rollout_candidate_groups",
     "extract_rollout_token_groups",
     "timeline_summary_to_dict",
 ]

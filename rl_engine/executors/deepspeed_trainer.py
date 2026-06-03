@@ -24,12 +24,7 @@ from rl_engine.executors.training_contract import (
     RolloutStageResult,
     TorchRLTrainingConfig,
     TrainingStageResult,
-)
-from rl_engine.testing import (
-    compute_policy_ratio,
-    compute_reference_kl,
-    masked_mean,
-    selected_logprobs_reference,
+    compute_training_grpo_objective,
 )
 
 _TDestination = TypeVar("_TDestination", bound=dict[str, Any])
@@ -106,20 +101,8 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
         batch, payload_metrics = self._batch_from_rollout_or_synthetic(rollout)
 
         logits = _extract_logits(self.engine(batch.token_ids.long()))
-        current_logps = selected_logprobs_reference(
-            logits,
-            batch.token_ids,
-            mask=batch.completion_mask,
-            output_dtype=torch.float32,
-        )
-        old_logps = current_logps.detach() - 0.01
-        ref_logps = current_logps.detach() - 0.02
-        ratio = compute_policy_ratio(current_logps, old_logps, batch.completion_mask)
-        unclipped = ratio * batch.advantages.float()
-        clipped = torch.clamp(ratio, 0.8, 1.2) * batch.advantages.float()
-        policy_loss = -torch.minimum(unclipped, clipped)
-        kl = compute_reference_kl(current_logps, ref_logps, batch.completion_mask)
-        loss = masked_mean(policy_loss + 0.01 * kl, batch.completion_mask)
+        objective = compute_training_grpo_objective(logits, batch, self.config)
+        loss = objective.loss
 
         if hasattr(self.engine, "zero_grad"):
             try:
@@ -145,6 +128,8 @@ class DeepSpeedTrainingWorker(RolloutBatchMixin):
                 "training_device": str(self.device),
                 "deepspeed_engine": type(self.engine).__name__,
                 "deepspeed_zero_stage": self.config.zero_stage,
+                "objective": "grpo",
+                **objective.metrics,
                 **payload_metrics,
             },
             started_at=started_at,

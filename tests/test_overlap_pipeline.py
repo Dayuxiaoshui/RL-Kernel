@@ -7,8 +7,10 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import pytest
+import torch
 
 from rl_engine.executors.overlap_pipeline import (
     IterationSpec,
@@ -21,7 +23,12 @@ from rl_engine.executors.overlap_pipeline import (
     TorchRLTrainingConfig,
     TorchRLTrainingWorker,
     TrainingStageResult,
+    extract_rollout_candidate_groups,
     extract_rollout_token_groups,
+)
+from rl_engine.executors.training_contract import (
+    compute_training_grpo_objective,
+    extract_rollout_logp_groups,
 )
 
 
@@ -380,8 +387,378 @@ def test_torch_rl_training_worker_runs_real_optimizer_step():
     assert result.metrics["training_data_source"] == "rollout_payload"
     assert result.metrics["rollout_sequences"] == 2
     assert result.metrics["rollout_tokens"] == 6
+    assert result.metrics["reward_source"] == "token_id_proxy"
     assert math.isfinite(result.metrics["loss"])
     assert result.metrics["active_tokens"] == 6
+    assert result.metrics["objective"] == "grpo"
+
+
+def test_torch_rl_training_worker_uses_payload_rewards_for_grpo_groups():
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=7,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {"token_ids": [1, 2], "reward": 1.0},
+                    {"token_ids": [3, 4], "reward": 3.0},
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    result = worker.train(rollout)
+
+    assert result.metrics["training_data_source"] == "rollout_payload"
+    assert result.metrics["reward_source"] == "payload_rewards"
+    assert result.metrics["rollout_prompt_groups"] == 1
+    assert result.metrics["rollout_sequences"] == 2
+    assert result.metrics["advantage_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert result.metrics["advantage_std"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_training_grpo_uses_payload_old_and_reference_logps_as_fixed_inputs():
+    config = TorchRLTrainingConfig(
+        num_prompts=1,
+        samples_per_prompt=2,
+        prompt_len=1,
+        completion_len=2,
+        vocab_size=16,
+        hidden_dim=8,
+        valid_density=1.0,
+        seed=11,
+        require_payload_rewards=True,
+        require_payload_logps=True,
+        kl_beta=0.4,
+    )
+    worker = TorchRLTrainingWorker(config)
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {
+                        "token_ids": [1, 2],
+                        "reward": 1.0,
+                        "old_logps": [-0.20, -0.30],
+                        "reference_logprobs": [-0.40, -0.50],
+                    },
+                    {
+                        "token_ids": [3, 4],
+                        "reward": 3.0,
+                        "old_selected_logprobs": [-1.20, -1.00],
+                        "ref_selected_logps": [-0.80, -0.90],
+                    },
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    batch, metrics = worker._batch_from_rollout_or_synthetic(rollout)
+    logits = torch.zeros((2, 2, config.vocab_size), requires_grad=True)
+    batch.old_logps.requires_grad_()
+    batch.ref_logps.requires_grad_()
+
+    payload_result = compute_training_grpo_objective(logits, batch, config)
+    smoke_batch = replace(batch, metadata={**batch.metadata, "logprob_source": "smoke_logps"})
+    smoke_result = compute_training_grpo_objective(logits.detach().clone(), smoke_batch, config)
+    payload_result.loss.backward()
+
+    assert metrics["reward_source"] == "payload_rewards"
+    assert metrics["logprob_source"] == "payload_logps"
+    assert batch.metadata["logprob_source"] == "payload_logps"
+    assert torch.allclose(batch.old_logps, torch.tensor([[-0.20, -0.30], [-1.20, -1.00]]))
+    assert torch.allclose(batch.ref_logps, torch.tensor([[-0.40, -0.50], [-0.80, -0.90]]))
+    assert payload_result.metrics["logprob_source"] == "payload_logps"
+    assert not torch.allclose(payload_result.loss.detach(), smoke_result.loss.detach())
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0
+    assert batch.old_logps.grad is None
+    assert batch.ref_logps.grad is None
+
+
+def test_torch_rl_training_worker_strict_logps_reject_missing_or_mismatched_payload():
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=12,
+            require_payload_logps=True,
+        )
+    )
+    missing_ref = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {"token_ids": [1], "old_logps": [-0.1]},
+                    {"token_ids": [2], "old_logps": [-0.2]},
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+    mismatched_lengths = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {
+                        "token_ids": [1, 2],
+                        "old_logps": [-0.1],
+                        "ref_logps": [-0.2, -0.3],
+                    },
+                    {
+                        "token_ids": [3],
+                        "old_logps": [-0.4],
+                        "ref_logps": [-0.5],
+                    },
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    with pytest.raises(ValueError, match="old/ref selected logprobs"):
+        worker.train(missing_ref)
+    with pytest.raises(ValueError, match="old/ref selected logprobs"):
+        worker.train(mismatched_lengths)
+
+
+def test_torch_rl_training_worker_uses_reward_provider_when_payload_rewards_are_absent():
+    calls = []
+
+    def reward_provider(candidate_groups, rollout):
+        calls.append((candidate_groups, rollout.iteration))
+        return [[1.0, 5.0]]
+
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=13,
+            reward_provider=reward_provider,
+            require_payload_rewards=True,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=7,
+        weight_version=4,
+        payload={"normalized_outputs": [[{"token_ids": [1, 2]}, {"token_ids": [3, 4]}]]},
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    batch, metrics = worker._batch_from_rollout_or_synthetic(rollout)
+
+    assert calls == [([[[1, 2], [3, 4]]], 7)]
+    assert metrics["reward_source"] == "provider_rewards"
+    assert batch.metadata["reward_source"] == "provider_rewards"
+    assert torch.allclose(batch.rewards, torch.tensor([1.0, 5.0]))
+
+
+def test_torch_rl_training_worker_rejects_malformed_reward_provider_output():
+    def reward_provider(candidate_groups, rollout):
+        del candidate_groups, rollout
+        return [[1.0]]
+
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=14,
+            reward_provider=reward_provider,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={"normalized_outputs": [[{"token_ids": [1]}, {"token_ids": [2]}]]},
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    with pytest.raises(ValueError, match="reward_provider must return one scalar reward"):
+        worker.train(rollout)
+
+
+def test_torch_rl_training_worker_preserves_empty_completions_with_payload_rewards():
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=8,
+            require_payload_rewards=True,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {"token_ids": [], "reward": 0.0},
+                    {"token_ids": [5], "reward": 2.0},
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    result = worker.train(rollout)
+
+    assert result.metrics["training_data_source"] == "rollout_payload"
+    assert result.metrics["reward_source"] == "payload_rewards"
+    assert result.metrics["rollout_prompt_groups"] == 1
+    assert result.metrics["rollout_sequences"] == 2
+    assert result.metrics["rollout_tokens"] == 1
+    assert result.metrics["active_tokens"] == 1
+    assert result.metrics["advantage_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert result.metrics["advantage_std"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_torch_rl_training_worker_accepts_empty_completion_payload_logps():
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=15,
+            require_payload_rewards=True,
+            require_payload_logps=True,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {"token_ids": [], "reward": 0.0, "old_logps": [], "ref_logps": []},
+                    {
+                        "token_ids": [5],
+                        "reward": 2.0,
+                        "old_logps": [-0.4],
+                        "ref_logps": [-0.6],
+                    },
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    result = worker.train(rollout)
+
+    assert result.metrics["reward_source"] == "payload_rewards"
+    assert result.metrics["logprob_source"] == "payload_logps"
+    assert result.metrics["rollout_tokens"] == 1
+    assert result.metrics["active_tokens"] == 1
+
+
+def test_torch_rl_training_worker_strict_rewards_reject_missing_rewards():
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=9,
+            require_payload_rewards=True,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={
+            "normalized_outputs": [
+                [
+                    {"token_ids": [1], "reward": 1.0},
+                    {"token_ids": [2]},
+                ]
+            ]
+        },
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    with pytest.raises(ValueError, match="requires one scalar reward"):
+        worker.train(rollout)
+
+
+def test_torch_rl_training_worker_strict_rewards_reject_synthetic_fallback():
+    worker = TorchRLTrainingWorker(
+        TorchRLTrainingConfig(
+            num_prompts=1,
+            samples_per_prompt=2,
+            prompt_len=1,
+            completion_len=2,
+            vocab_size=16,
+            hidden_dim=8,
+            valid_density=1.0,
+            seed=10,
+            require_payload_rewards=True,
+        )
+    )
+    rollout = RolloutStageResult(
+        iteration=0,
+        weight_version=4,
+        payload={"prompts": ["no candidates"]},
+        started_at=time.perf_counter(),
+        finished_at=time.perf_counter(),
+    )
+
+    with pytest.raises(ValueError, match="requires rollout payload candidate groups"):
+        worker.train(rollout)
 
 
 def test_extract_rollout_token_groups_from_normalized_payload():
@@ -393,3 +770,52 @@ def test_extract_rollout_token_groups_from_normalized_payload():
     }
 
     assert extract_rollout_token_groups(payload) == [[1, 2], [3], [4, 5, 6]]
+
+
+def test_extract_rollout_candidate_groups_preserves_prompt_boundaries():
+    payload = {
+        "normalized_outputs": [
+            [{"token_ids": [1, 2]}, {"token_ids": [3]}],
+            [{"outputs": [{"token_ids": [4, 5, 6]}]}],
+        ]
+    }
+
+    assert extract_rollout_candidate_groups(payload) == [[[1, 2], [3]], [[4, 5, 6]]]
+
+
+def test_extract_rollout_candidate_groups_preserves_empty_completions():
+    payload = {
+        "normalized_outputs": [
+            [{"token_ids": []}, {"token_ids": [3]}],
+            [{"outputs": [{"token_ids": []}]}],
+        ]
+    }
+
+    assert extract_rollout_candidate_groups(payload) == [[[], [3]], [[]]]
+    assert extract_rollout_token_groups(payload) == [[], [3], []]
+
+
+def test_extract_rollout_logp_groups_supports_nested_aliases_and_empty_vectors():
+    payload = {
+        "outputs": [
+            [
+                {
+                    "outputs": [
+                        {
+                            "token_ids": [1, 2],
+                            "old_policy_logprobs": [-0.1, -0.2],
+                            "reference_selected_logprobs": [-0.3, -0.4],
+                        }
+                    ]
+                },
+                {"token_ids": [], "old_logps": [], "ref_logps": []},
+            ]
+        ]
+    }
+
+    assert extract_rollout_logp_groups(payload, keys=("old_logps", "old_policy_logprobs")) == [
+        [[-0.1, -0.2], []]
+    ]
+    assert extract_rollout_logp_groups(
+        payload, keys=("ref_logps", "reference_selected_logprobs")
+    ) == [[[-0.3, -0.4], []]]
