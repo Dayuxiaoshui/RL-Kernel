@@ -35,14 +35,14 @@ void prefix_shared_attention_forward(
   int dim);
 
 at::Tensor prefix_shared_attention(
-  const at::Tensor& Q, 
-  const at::Tensor& K, 
-  const at::Tensor& V) 
+  const at::Tensor& Q,
+  const at::Tensor& K,
+  const at::Tensor& V)
 {
   TORCH_CHECK(Q.dim() == 4, "Q must be [bs, G, len_q, DIM]");
   TORCH_CHECK(K.dim() == 3, "K must be [bs, len_kv, DIM]");
   TORCH_CHECK(V.dim() == 3, "V must be [bs, len_kv, DIM]");
-  
+
   TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Only BFloat16 is supported");
   TORCH_CHECK(Q.is_cuda() && Q.is_contiguous(), "Tensors must be CUDA and contiguous");
   TORCH_CHECK(K.is_cuda() && K.is_contiguous(), "Tensors must be CUDA and contiguous");
@@ -86,7 +86,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_logp_forward_online_fp32", &fused_logp_forward_online_fp32, "Fused logp online fp32");
     m.def("fused_logp_forward_online_indexed_out", &fused_logp_forward_online_indexed_out, "Fused logp online indexed out");
     m.def("fused_logp_forward_online_indexed_fp32", &fused_logp_forward_online_indexed_fp32, "Fused logp online indexed fp32");
-        
+
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 #endif

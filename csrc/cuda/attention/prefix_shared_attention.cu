@@ -109,7 +109,7 @@ void prefix_shared_attention_kernel(
 
   extern __shared__ nv_bfloat16 smem[];
   const uint32_t Q_smem = __cvta_generic_to_shared(smem);
-  const uint32_t K_smem = Q_smem; 
+  const uint32_t K_smem = Q_smem;
   const uint32_t V_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(nv_bfloat16);
 
   constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
@@ -121,7 +121,7 @@ void prefix_shared_attention_kernel(
   uint32_t K_rmem[BLOCK_KV / MMA_N][DIM / MMA_K][2];
   uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
   uint32_t V_rmem[BLOCK_KV / MMA_K][DIM / MMA_N][2];
-  
+
   float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4] = {};
   const float softmax_scale = rsqrtf(static_cast<float>(DIM));
   float rowmax[WARP_Q / MMA_M][2];
@@ -157,8 +157,8 @@ void prefix_shared_attention_kernel(
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++) {
       uint32_t addr = Q_smem_thread;
-      addr += mma_id_q * MMA_M * DIM * sizeof(nv_bfloat16); 
-      addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16); 
+      addr += mma_id_q * MMA_M * DIM * sizeof(nv_bfloat16);
+      addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16);
       ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
     }
   __syncthreads();
@@ -173,7 +173,7 @@ void prefix_shared_attention_kernel(
     }
     asm volatile("cp.async.commit_group;");
   };
-  
+
   auto load_V = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
         const uint32_t dst = V_smem;
@@ -188,12 +188,12 @@ void prefix_shared_attention_kernel(
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
     float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
-    __syncthreads(); 
+    __syncthreads();
     load_V(kv_id);
 
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
-    
+
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d += 2) {
         uint32_t addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
@@ -312,9 +312,9 @@ void prefix_shared_attention_kernel(
 
 // Host API
 void prefix_shared_attention_forward(
-  const __nv_bfloat16 *Q, const __nv_bfloat16 *K, const __nv_bfloat16 *V, __nv_bfloat16 *O, 
+  const __nv_bfloat16 *Q, const __nv_bfloat16 *K, const __nv_bfloat16 *V, __nv_bfloat16 *O,
   int bs, int G, int len_q, int len_kv, int dim) {
-  
+
   if (dim != 128) { std::cerr << "Only dim=128 supported." << std::endl; exit(1); }
 
   const int BLOCK_Q = 64;
