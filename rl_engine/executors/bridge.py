@@ -1041,7 +1041,7 @@ class _CUDAVMMDriverBackend:
             "cuMemImportFromShareableHandle": [c.POINTER(c.c_uint64), c.c_void_p, c.c_int],
             "cuMemcpyHtoD_v2": [c.c_uint64, c.c_void_p, c.c_size_t],
             "cuMemcpyDtoD_v2": [c.c_uint64, c.c_uint64, c.c_size_t],
-            "cuCtxSynchronize": [],
+            "cuMemcpyDtoDAsync_v2": [c.c_uint64, c.c_uint64, c.c_size_t, c.c_void_p],
         }.items():
             getattr(self.lib, name).argtypes = args
 
@@ -1266,19 +1266,37 @@ class _CUDAVMMDriverBackend:
         if handle:
             self.lib.cuMemRelease(int(handle))
 
-    def copy_tensor_to_address(self, destination_address: int, tensor: torch.Tensor) -> None:
+    def copy_tensor_to_address(
+        self,
+        destination_address: int,
+        tensor: torch.Tensor,
+        *,
+        stream: Optional[int] = None,
+    ) -> None:
         if tensor.device.type != "cuda":
             raise WeightBridgeUnavailableError("CUDA VMM copy requires a CUDA source tensor")
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         nbytes = int(tensor.numel() * tensor.element_size())
+        if stream is None:
+            self._check(
+                self.lib.cuMemcpyDtoD_v2(
+                    int(destination_address),
+                    int(tensor.data_ptr()),
+                    nbytes,
+                ),
+                "cuMemcpyDtoD",
+            )
+            return
         self._check(
-            self.lib.cuMemcpyDtoD_v2(int(destination_address), int(tensor.data_ptr()), nbytes),
-            "cuMemcpyDtoD",
+            self.lib.cuMemcpyDtoDAsync_v2(
+                int(destination_address),
+                int(tensor.data_ptr()),
+                nbytes,
+                self.ctypes.c_void_p(int(stream)),
+            ),
+            "cuMemcpyDtoDAsync",
         )
-
-    def synchronize(self) -> None:
-        self._check(self.lib.cuCtxSynchronize(), "cuCtxSynchronize")
 
 
 class WeightBridgeError(RuntimeError):
@@ -1408,6 +1426,8 @@ class _CUDAVMMAllocationRecord:
     socket_path: str
     thread: Any
     stop_event: Any
+    sync_event: Any = None
+    copy_sources: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -1418,6 +1438,7 @@ class _CUDAVMMImportRecord:
     socket_fd: int
     posix_fd: int
     dlpack_owners: list[Any] = field(default_factory=list)
+    sync_event: Any = None
 
 
 def _pack_tensors_for_cuda_vmm(
@@ -1733,7 +1754,7 @@ class SharedMemoryTensorBridge(LocalTensorCopyBridge):
                         "SharedMemoryTensorBridge currently supports CPU tensors only. "
                         f"Tensor {name} is on {tensor.device}."
                     )
-                snapshot = tensor.detach().clone(memory_format=torch.preserve_format)
+                snapshot = tensor.detach().contiguous()
                 storage_offset = int(snapshot.storage_offset())
                 shape = tuple(int(dim) for dim in snapshot.shape)
                 stride = tuple(int(item) for item in snapshot.stride())
@@ -1989,6 +2010,10 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
         if not state_tensors:
             raise WeightManifestValidationError("model state_dict produced no CUDA tensors")
 
+        descriptors = {
+            name: TensorDescriptor.from_tensor(name, tensor)
+            for name, tensor in state_tensors.items()
+        }
         backend = self._get_backend()
         if not backend.supports_posix_fd_vmm():
             raise WeightBridgeUnavailableError(
@@ -1997,21 +2022,21 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
         handle, address, mapped_nbytes, exported_fd = backend.create_allocation(requested_nbytes)
         try:
             tensors: dict[str, torch.Tensor] = {}
+            stream = torch.cuda.current_stream(self.device_index)
+            stream_handle = int(stream.cuda_stream)
             for name, tensor in state_tensors.items():
                 entry = entries[name]
                 destination = address + int(entry["offset"])
-                backend.copy_tensor_to_address(destination, tensor)
+                backend.copy_tensor_to_address(destination, tensor, stream=stream_handle)
                 tensors[name] = self._tensor_from_address(
                     destination,
                     tuple(int(dim) for dim in tensor.shape),
                     tuple(int(item) for item in tensor.stride()),
                     tensor.dtype,
                 )
-            backend.synchronize()
-
-            descriptors = {
-                name: TensorDescriptor.from_tensor(name, tensor) for name, tensor in tensors.items()
-            }
+            sync_event = torch.cuda.Event(interprocess=True)
+            sync_event.record(stream)
+            ipc_event_handle = sync_event.ipc_handle()
             update_id = str(uuid.uuid4())
             socket_path, thread, stop_event = self._start_fd_broker(update_id, exported_fd)
             manifest = WeightUpdateManifest(
@@ -2030,6 +2055,7 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
                         "mapped_nbytes": mapped_nbytes,
                         "requested_nbytes": requested_nbytes,
                         "device_index": self.device_index,
+                        "ipc_event_handle": ipc_event_handle,
                         "tensors": entries,
                     },
                 },
@@ -2046,6 +2072,8 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
                 socket_path=socket_path,
                 thread=thread,
                 stop_event=stop_event,
+                sync_event=sync_event,
+                copy_sources=list(state_tensors.values()),
             )
             self._owned_cuda_vmm_update_ids.add(manifest.update_id)
             self._latest_published_weight_version = version
@@ -2072,6 +2100,7 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
         if record.state == "released":
             raise WeightUpdateRejectedError(f"weight update {manifest.update_id} was released")
 
+        self._wait_for_cuda_vmm_publish_event(manifest)
         self._validate_manifest(record, manifest)
         record.import_count += 1
         if record.state == "published":
@@ -2131,6 +2160,26 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
             else:
                 self._backend = _CUDAVMMDriverBackend(device_index=self.device_index)
         return self._backend
+
+    def _wait_for_cuda_vmm_publish_event(self, manifest: WeightUpdateManifest) -> Any:
+        bridge_metadata = manifest.metadata.get(_BRIDGE_METADATA_KEY)
+        if not isinstance(bridge_metadata, Mapping):
+            raise WeightManifestValidationError("CUDA VMM manifest is missing bridge metadata")
+        ipc_event_handle = bridge_metadata.get("ipc_event_handle")
+        if ipc_event_handle is None:
+            raise WeightManifestValidationError(
+                "CUDA VMM manifest is missing IPC sync event handle"
+            )
+
+        stream = torch.cuda.current_stream(self.device_index)
+        allocation = self._cuda_vmm_allocations.get(manifest.update_id)
+        if allocation is not None and allocation.sync_event is not None:
+            allocation.sync_event.wait(stream)
+            return allocation.sync_event
+
+        remote_event = torch.cuda.Event.from_ipc_handle(self.device_index, ipc_event_handle)
+        remote_event.wait(stream)
+        return remote_event
 
     def _tensor_from_address(
         self,
@@ -2230,6 +2279,7 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
             sock.connect(socket_path)
             posix_fd = _recv_fd(sock)
             allocation_handle, address = backend.import_allocation(posix_fd, mapped_nbytes)
+            sync_event = self._wait_for_cuda_vmm_publish_event(manifest)
             tensors: dict[str, torch.Tensor] = {}
             for name, descriptor in manifest.tensors.items():
                 entry = entries[name]
@@ -2268,6 +2318,7 @@ class CUDAVMMTensorBridge(LocalTensorCopyBridge):
                 socket_fd=socket_fd,
                 posix_fd=posix_fd,
                 dlpack_owners=owners,
+                sync_event=sync_event,
             )
             sock.detach()
             return record
@@ -2345,7 +2396,7 @@ class IPCWeightBridge(LocalTensorCopyBridge):
                     "CUDA IPC weight bridge requires CUDA tensors. "
                     f"Tensor {name} is on {tensor.device}."
                 )
-            snapshot = tensor.detach().clone(memory_format=torch.preserve_format)
+            snapshot = tensor.detach().contiguous()
             tensors[name] = snapshot
             handles[name] = reduce_tensor(snapshot)
 
