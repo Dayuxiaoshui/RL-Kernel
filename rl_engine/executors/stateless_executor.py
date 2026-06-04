@@ -13,6 +13,7 @@ import torch
 from rl_engine.testing.reference_ops import selected_logprobs_reference
 
 StatelessForwardMode = Literal["reference", "reward", "both"]
+StatelessAttentionBackend = Literal["flash_attention_2", "sdpa", "eager", "model_default"]
 RewardAdapter = Callable[["StatelessForwardOutputs", "StatelessForwardInputs"], torch.Tensor]
 
 
@@ -22,6 +23,8 @@ class StatelessForwardConfig:
 
     mode: StatelessForwardMode = "both"
     use_cache: bool = False
+    attention_backend: StatelessAttentionBackend = "flash_attention_2"
+    reject_kv_cache_outputs: bool = True
     detach_outputs: bool = True
     return_token_scores: bool = False
     max_batch_size: Optional[int] = None
@@ -33,6 +36,11 @@ class StatelessForwardConfig:
             raise ValueError("mode must be 'reference', 'reward', or 'both'")
         if self.use_cache:
             raise ValueError("StatelessForwardConfig.use_cache must be False")
+        if self.attention_backend not in {"flash_attention_2", "sdpa", "eager", "model_default"}:
+            raise ValueError(
+                "attention_backend must be 'flash_attention_2', 'sdpa', 'eager', "
+                "or 'model_default'"
+            )
         if self.max_batch_size is not None and self.max_batch_size <= 0:
             raise ValueError("max_batch_size must be greater than zero")
         if self.temperature <= 0.0:
@@ -55,6 +63,7 @@ class StatelessForwardOutputs:
 
     raw: Any
     logits: Optional[torch.Tensor]
+    kv_cache: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,18 @@ class StatelessForwardResult:
     rewards: Optional[torch.Tensor]
     token_scores: Optional[torch.Tensor]
     metrics: Mapping[str, float | int | str | bool]
+
+
+@dataclass(frozen=True)
+class TensorTreeSummary:
+    """Count tensor payloads in nested optional runtime outputs."""
+
+    tensor_count: int
+    total_bytes: int
+
+    @property
+    def total_mb(self) -> float:
+        return self.total_bytes / 1_048_576.0
 
 
 class StatelessForwardExecutor:
@@ -89,6 +110,7 @@ class StatelessForwardExecutor:
 
     def score(self, inputs: StatelessForwardInputs) -> StatelessForwardResult:
         _validate_inputs(inputs, self.config)
+        no_cache_policy = configure_stateless_model(self.model, self.config)
 
         device = inputs.input_ids.device
         cuda_tracking = device.type == "cuda" and torch.cuda.is_available()
@@ -99,7 +121,19 @@ class StatelessForwardExecutor:
         started_at = time.perf_counter()
         with torch.no_grad():
             raw_outputs, use_cache_passed = _run_no_cache_forward(self.model, inputs)
-            outputs = StatelessForwardOutputs(raw=raw_outputs, logits=_extract_logits(raw_outputs))
+            kv_cache = extract_kv_cache_outputs(raw_outputs)
+            kv_cache_summary = summarize_tensor_tree(kv_cache)
+            if self.config.reject_kv_cache_outputs and kv_cache is not None:
+                raise ValueError(
+                    "stateless scoring received KV-cache outputs despite use_cache=False "
+                    f"({kv_cache_summary.tensor_count} tensors, "
+                    f"{kv_cache_summary.total_mb:.4f} MiB)."
+                )
+            outputs = StatelessForwardOutputs(
+                raw=raw_outputs,
+                logits=_extract_logits(raw_outputs),
+                kv_cache=kv_cache,
+            )
 
             reference_logps: Optional[torch.Tensor] = None
             rewards: Optional[torch.Tensor] = None
@@ -141,6 +175,8 @@ class StatelessForwardExecutor:
             use_cache_passed=use_cache_passed,
             detached_outputs=self.config.detach_outputs,
             cuda_tracking=cuda_tracking,
+            no_cache_policy=no_cache_policy,
+            kv_cache_summary=kv_cache_summary,
         )
         return StatelessForwardResult(
             reference_logps=reference_logps,
@@ -237,6 +273,8 @@ def collect_stateless_metrics(
     use_cache_passed: bool,
     detached_outputs: bool,
     cuda_tracking: bool,
+    no_cache_policy: Mapping[str, float | int | str | bool],
+    kv_cache_summary: TensorTreeSummary,
 ) -> dict[str, float | int | str | bool]:
     """Collect common scoring metrics without importing optional runtimes."""
 
@@ -253,12 +291,52 @@ def collect_stateless_metrics(
         "use_cache": False,
         "use_cache_passed": bool(use_cache_passed),
         "detached_outputs": bool(detached_outputs),
+        "zero_kv_cache": kv_cache_summary.tensor_count == 0,
+        "kv_cache_output_present": kv_cache_summary.tensor_count > 0,
+        "kv_cache_output_tensors": kv_cache_summary.tensor_count,
+        "kv_cache_output_bytes": kv_cache_summary.total_bytes,
+        "kv_cache_output_mb": kv_cache_summary.total_mb,
+        **dict(no_cache_policy),
     }
     if cuda_tracking:
         device = input_ids.device
         metrics["peak_allocated_mb"] = torch.cuda.max_memory_allocated(device) / 1_048_576.0
         metrics["peak_reserved_mb"] = torch.cuda.max_memory_reserved(device) / 1_048_576.0
     return metrics
+
+
+def configure_stateless_model(
+    model: torch.nn.Module,
+    config: StatelessForwardConfig,
+) -> dict[str, float | int | str | bool]:
+    """
+    Apply best-effort no-cache scoring knobs without importing optional runtimes.
+
+    Hugging Face-style models decide attention kernels from their config rather
+    than forward kwargs. Setting these attributes keeps the wrapper explicit
+    while still allowing plain PyTorch modules to run unchanged.
+    """
+
+    use_cache_targets = 0
+    attention_targets = 0
+
+    for target in _model_config_targets(model):
+        if hasattr(target, "use_cache"):
+            setattr(target, "use_cache", False)
+            use_cache_targets += 1
+        if config.attention_backend != "model_default":
+            setattr(target, "attn_implementation", config.attention_backend)
+            setattr(target, "_attn_implementation", config.attention_backend)
+            attention_targets += 1
+
+    return {
+        "attention_backend": config.attention_backend,
+        "attention_backend_configured": attention_targets > 0,
+        "attention_backend_config_targets": attention_targets,
+        "model_config_use_cache_disabled": use_cache_targets > 0,
+        "model_config_use_cache_targets": use_cache_targets,
+        "reject_kv_cache_outputs": config.reject_kv_cache_outputs,
+    }
 
 
 def _validate_inputs(inputs: StatelessForwardInputs, config: StatelessForwardConfig) -> None:
@@ -340,6 +418,64 @@ def _extract_logits(raw_outputs: Any) -> Optional[torch.Tensor]:
     return None
 
 
+def extract_kv_cache_outputs(raw_outputs: Any) -> Optional[Any]:
+    """Extract common cache-bearing output fields from model outputs."""
+
+    names = (
+        "past_key_values",
+        "past_key_value",
+        "presents",
+        "present",
+        "kv_cache",
+        "cache",
+    )
+    if isinstance(raw_outputs, Mapping):
+        for name in names:
+            if name in raw_outputs and raw_outputs[name] is not None:
+                return raw_outputs[name]
+        return None
+
+    for name in names:
+        value = getattr(raw_outputs, name, None)
+        if value is not None:
+            return value
+
+    if isinstance(raw_outputs, (tuple, list)) and len(raw_outputs) > 1:
+        candidate = raw_outputs[1]
+        if _looks_like_kv_cache(candidate):
+            return candidate
+    return None
+
+
+def summarize_tensor_tree(value: Any) -> TensorTreeSummary:
+    """Count tensors and bytes in nested tuples/lists/mappings/dataclass-like outputs."""
+
+    seen: set[int] = set()
+
+    def visit(node: Any) -> tuple[int, int]:
+        if node is None:
+            return 0, 0
+        node_id = id(node)
+        if node_id in seen:
+            return 0, 0
+        seen.add(node_id)
+
+        if isinstance(node, torch.Tensor):
+            return 1, _tensor_nbytes(node)
+        if isinstance(node, Mapping):
+            counts = [visit(item) for item in node.values()]
+        elif isinstance(node, (tuple, list)):
+            counts = [visit(item) for item in node]
+        elif hasattr(node, "__dict__"):
+            counts = [visit(item) for item in vars(node).values()]
+        else:
+            return 0, 0
+        return sum(count for count, _bytes in counts), sum(_bytes for _count, _bytes in counts)
+
+    tensor_count, total_bytes = visit(value)
+    return TensorTreeSummary(tensor_count=tensor_count, total_bytes=total_bytes)
+
+
 def _extract_named_tensor(raw_outputs: Any, names: tuple[str, ...]) -> Optional[torch.Tensor]:
     if isinstance(raw_outputs, Mapping):
         for name in names:
@@ -367,3 +503,24 @@ def _bool_mask(mask: torch.Tensor, *, device: torch.device) -> torch.Tensor:
 
 def _detach_optional(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return tensor.detach() if tensor is not None else None
+
+
+def _model_config_targets(model: torch.nn.Module) -> list[Any]:
+    targets: list[Any] = []
+    seen: set[int] = set()
+    for name in ("config", "generation_config"):
+        target = getattr(model, name, None)
+        if target is None or id(target) in seen:
+            continue
+        targets.append(target)
+        seen.add(id(target))
+    return targets
+
+
+def _looks_like_kv_cache(value: Any) -> bool:
+    summary = summarize_tensor_tree(value)
+    return summary.tensor_count > 0
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())

@@ -488,6 +488,9 @@ def test_stateless_scoring_worker_attaches_rewards_for_training_payload():
     assert extract_rollout_reward_groups(scored.payload) == [[1.0, 3.0]]
     assert scored.metrics["scoring_backend"] == "stateless"
     assert scored.metrics["scoring_mode"] == "reward"
+    assert scored.metrics["scoring_zero_kv_cache"] is True
+    assert scored.metrics["scoring_attention_backend"] == "flash_attention_2"
+    assert scored.metrics["scoring_kv_cache_output_mb"] == 0.0
 
     worker = TorchRLTrainingWorker(
         TorchRLTrainingConfig(
@@ -559,6 +562,8 @@ def test_stateless_scoring_worker_attaches_reference_logps_for_training_payload(
 
     assert scorer_model.use_cache_calls == [False]
     assert extract_rollout_reward_groups(scored.payload) == [[1.0, 3.0]]
+    assert scored.metrics["scoring_zero_kv_cache"] is True
+    assert scored.metrics["scoring_attention_backend"] == "flash_attention_2"
     reference_groups = extract_rollout_reference_logp_groups(scored.payload)
     assert len(reference_groups) == 1
     assert [len(row) for row in reference_groups[0]] == [2, 2]

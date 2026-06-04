@@ -27,7 +27,13 @@ class FakeGenerationReferenceModel(torch.nn.Module):
     def forward(self, input_ids, attention_mask=None, use_cache=None):
         del attention_mask
         self.use_cache_calls.append(use_cache)
-        return SimpleNamespace(logits=self.fixed_logits[: input_ids.shape[0], : input_ids.shape[1]])
+        batch, seq_len = input_ids.shape
+        key = torch.empty(batch, 1, seq_len, 4, device=input_ids.device)
+        value = torch.empty_like(key)
+        return SimpleNamespace(
+            logits=self.fixed_logits[: input_ids.shape[0], : input_ids.shape[1]],
+            past_key_values=((key, value),) if use_cache else None,
+        )
 
 
 def _inputs() -> StatelessForwardInputs:
@@ -123,6 +129,10 @@ def test_paged_kv_baseline_scores_like_reference_path_and_enables_cache():
     assert result.metrics["use_cache_passed"] is True
     assert result.metrics["paged_kv_required_blocks"] == 5
     assert result.metrics["paged_kv_cache_reserved_mb"] > 0.0
+    assert result.metrics["model_kv_cache_output_present"] is True
+    assert result.metrics["model_kv_cache_output_tensors"] == 2
+    assert result.metrics["model_kv_cache_output_mb"] > 0.0
+    assert result.metrics["total_kv_cache_mb"] > result.metrics["paged_kv_cache_reserved_mb"]
 
 
 def test_paged_kv_reservation_rejects_capacity_smaller_than_batch_needs():

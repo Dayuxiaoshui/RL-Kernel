@@ -16,9 +16,12 @@ from rl_engine.executors.stateless_executor import (
     StatelessForwardMode,
     StatelessForwardOutputs,
     StatelessForwardResult,
+    TensorTreeSummary,
     default_reward_adapter,
+    extract_kv_cache_outputs,
     score_reference_logprobs,
     score_rewards,
+    summarize_tensor_tree,
 )
 
 
@@ -118,7 +121,13 @@ class PagedKVScoringBaseline:
                 inputs,
                 use_cache=self.config.use_cache,
             )
-            outputs = StatelessForwardOutputs(raw=raw_outputs, logits=_extract_logits(raw_outputs))
+            kv_cache = extract_kv_cache_outputs(raw_outputs)
+            kv_cache_summary = summarize_tensor_tree(kv_cache)
+            outputs = StatelessForwardOutputs(
+                raw=raw_outputs,
+                logits=_extract_logits(raw_outputs),
+                kv_cache=kv_cache,
+            )
 
             reference_logps: Optional[torch.Tensor] = None
             rewards: Optional[torch.Tensor] = None
@@ -160,6 +169,7 @@ class PagedKVScoringBaseline:
             elapsed_seconds=finished_at - started_at,
             use_cache_passed=use_cache_passed,
             cuda_tracking=cuda_tracking,
+            model_kv_cache_summary=kv_cache_summary,
         )
         return StatelessForwardResult(
             reference_logps=reference_logps,
@@ -254,11 +264,14 @@ def collect_paged_kv_metrics(
     elapsed_seconds: float,
     use_cache_passed: bool,
     cuda_tracking: bool,
+    model_kv_cache_summary: TensorTreeSummary,
 ) -> dict[str, float | int | str | bool]:
     input_ids = inputs.input_ids
     active_tokens = int(_bool_mask(inputs.completion_mask, device=input_ids.device).sum().item())
+    total_kv_cache_bytes = reservation.reserved_bytes + model_kv_cache_summary.total_bytes
     metrics: dict[str, float | int | str | bool] = {
         "baseline_kind": "generation_engine_paged_kv_reservation",
+        "baseline_includes_model_kv_cache": model_kv_cache_summary.tensor_count > 0,
         "mode": config.mode,
         "batch_size": int(input_ids.shape[0]),
         "sequence_len": int(input_ids.shape[1]),
@@ -281,6 +294,12 @@ def collect_paged_kv_metrics(
         "paged_kv_cache_reserved_mb": reservation.reserved_bytes / 1_048_576.0,
         "paged_kv_cache_payload_mb": reservation.cache_bytes / 1_048_576.0,
         "paged_kv_metadata_mb": reservation.metadata_bytes / 1_048_576.0,
+        "model_kv_cache_output_present": model_kv_cache_summary.tensor_count > 0,
+        "model_kv_cache_output_tensors": model_kv_cache_summary.tensor_count,
+        "model_kv_cache_output_bytes": model_kv_cache_summary.total_bytes,
+        "model_kv_cache_output_mb": model_kv_cache_summary.total_mb,
+        "total_kv_cache_bytes": total_kv_cache_bytes,
+        "total_kv_cache_mb": total_kv_cache_bytes / 1_048_576.0,
     }
     if cuda_tracking:
         device = input_ids.device

@@ -559,6 +559,9 @@ class StatelessScoringWorker:
                 "scoring_mode": result.metrics["mode"],
                 "scoring_elapsed_ms": result.metrics["elapsed_ms"],
                 "scoring_active_completion_tokens": result.metrics["active_completion_tokens"],
+                "scoring_zero_kv_cache": result.metrics["zero_kv_cache"],
+                "scoring_attention_backend": result.metrics["attention_backend"],
+                "scoring_kv_cache_output_mb": result.metrics["kv_cache_output_mb"],
             },
         )
 

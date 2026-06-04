@@ -26,12 +26,17 @@ class FakeReferenceModel(torch.nn.Module):
     def __init__(self, logits: torch.Tensor):
         super().__init__()
         self.register_buffer("fixed_logits", logits)
+        self.config = SimpleNamespace(use_cache=True, _attn_implementation="eager")
+        self.generation_config = SimpleNamespace(use_cache=True)
         self.use_cache_calls: list[bool | None] = []
 
     def forward(self, input_ids, attention_mask=None, use_cache=None):
         del attention_mask
         self.use_cache_calls.append(use_cache)
-        return SimpleNamespace(logits=self.fixed_logits[: input_ids.shape[0], : input_ids.shape[1]])
+        return SimpleNamespace(
+            logits=self.fixed_logits[: input_ids.shape[0], : input_ids.shape[1]],
+            past_key_values=None,
+        )
 
 
 class FakeRewardModel(torch.nn.Module):
@@ -52,6 +57,16 @@ class NoUseCacheModel(torch.nn.Module):
         batch, seq_len = input_ids.shape
         vocab = 8
         return torch.zeros(batch, seq_len, vocab, device=input_ids.device)
+
+
+class CacheReturningModel(torch.nn.Module):
+    def forward(self, input_ids, attention_mask=None, use_cache=None):
+        del attention_mask, use_cache
+        batch, seq_len = input_ids.shape
+        logits = torch.zeros(batch, seq_len, 8, device=input_ids.device)
+        key = torch.zeros(batch, 1, seq_len, 4, device=input_ids.device)
+        value = torch.zeros_like(key)
+        return {"logits": logits, "past_key_values": ((key, value),)}
 
 
 def _inputs() -> StatelessForwardInputs:
@@ -134,6 +149,14 @@ def test_executor_runs_full_sequence_forward_with_use_cache_false_and_detaches_o
     assert result.metrics["use_cache"] is False
     assert result.metrics["use_cache_passed"] is True
     assert result.metrics["detached_outputs"] is True
+    assert result.metrics["zero_kv_cache"] is True
+    assert result.metrics["kv_cache_output_tensors"] == 0
+    assert result.metrics["attention_backend"] == "flash_attention_2"
+    assert result.metrics["attention_backend_configured"] is True
+    assert result.metrics["model_config_use_cache_disabled"] is True
+    assert model.config.use_cache is False
+    assert model.generation_config.use_cache is False
+    assert model.config._attn_implementation == "flash_attention_2"
 
 
 def test_executor_falls_back_for_models_without_use_cache_argument():
@@ -147,6 +170,17 @@ def test_executor_falls_back_for_models_without_use_cache_argument():
 
     assert result.reference_logps is not None
     assert result.metrics["use_cache_passed"] is False
+
+
+def test_executor_rejects_models_that_return_kv_cache_outputs():
+    inputs = _inputs()
+    executor = StatelessForwardExecutor(
+        CacheReturningModel(),
+        StatelessForwardConfig(mode="reference"),
+    )
+
+    with pytest.raises(ValueError, match="KV-cache outputs"):
+        executor.score(inputs)
 
 
 def test_reward_mode_returns_one_scalar_per_sequence_with_default_adapter():
@@ -247,6 +281,9 @@ def test_executor_rejects_shape_mismatches_empty_masks_and_invalid_config():
 
     with pytest.raises(ValueError, match="use_cache"):
         StatelessForwardConfig(use_cache=True)
+
+    with pytest.raises(ValueError, match="attention_backend"):
+        StatelessForwardConfig(attention_backend="paged_attention")  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="mode"):
         StatelessForwardConfig(mode="generate")  # type: ignore[arg-type]

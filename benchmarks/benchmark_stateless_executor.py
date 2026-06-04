@@ -42,6 +42,8 @@ CSV_COLUMNS = [
     "peak_allocated_mb",
     "peak_reserved_mb",
     "paged_kv_baseline_mb",
+    "kv_cache_output_mb",
+    "zero_kv_cache_savings_mb",
     "status",
     "notes",
 ]
@@ -66,7 +68,11 @@ class TinyReferenceModel(torch.nn.Module):
     def forward(self, input_ids, attention_mask=None, use_cache=None):
         del attention_mask
         self.use_cache_calls.append(use_cache)
-        return SimpleNamespace(logits=self.proj(self.embedding(input_ids.long())))
+        hidden = self.embedding(input_ids.long())
+        return SimpleNamespace(
+            logits=self.proj(hidden),
+            past_key_values=_tiny_past_key_values(hidden, use_cache),
+        )
 
 
 class TinyRewardModel(torch.nn.Module):
@@ -83,7 +89,10 @@ class TinyRewardModel(torch.nn.Module):
         hidden = self.embedding(input_ids.long())
         mask = attention_mask.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
         pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        return {"logits": self.reward_head(pooled)}
+        return {
+            "logits": self.reward_head(pooled),
+            "past_key_values": _tiny_past_key_values(hidden, use_cache),
+        }
 
 
 class TinyBothModel(torch.nn.Module):
@@ -104,7 +113,25 @@ class TinyBothModel(torch.nn.Module):
         return {
             "logits": self.lm_head(hidden),
             "rewards": self.reward_head(pooled).squeeze(-1),
+            "past_key_values": _tiny_past_key_values(hidden, use_cache),
         }
+
+
+def _tiny_past_key_values(hidden: torch.Tensor, use_cache: bool | None):
+    if use_cache is not True:
+        return None
+    batch_size, seq_len, hidden_dim = hidden.shape
+    head_dim = max(1, min(hidden_dim, 8))
+    key = torch.empty(
+        batch_size,
+        1,
+        seq_len,
+        head_dim,
+        device=hidden.device,
+        dtype=hidden.dtype,
+    )
+    value = torch.empty_like(key)
+    return ((key, value),)
 
 
 def _timestamp() -> str:
@@ -220,10 +247,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "peak_allocated_mb": f"{float(peak_allocated):.4f}" if peak_allocated != "" else "",
         "peak_reserved_mb": f"{float(peak_reserved):.4f}" if peak_reserved != "" else "",
         "paged_kv_baseline_mb": "",
+        "kv_cache_output_mb": f"{float(result.metrics['kv_cache_output_mb']):.4f}",
+        "zero_kv_cache_savings_mb": "",
         "status": "pass",
         "notes": (
             f"use_cache_passed={result.metrics['use_cache_passed']};"
             f"detached_outputs={result.metrics['detached_outputs']};"
+            f"zero_kv_cache={result.metrics['zero_kv_cache']};"
+            f"attention_backend={result.metrics['attention_backend']};"
             f"hidden_dim={args.hidden_dim};vocab_size={args.vocab_size};{_environment()}"
         ),
     }
@@ -231,13 +262,19 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         paged_result = _score_paged_kv(args, inputs, model)
         paged_metrics = paged_result.metrics
         row["paged_kv_baseline_mb"] = f"{float(paged_metrics['paged_kv_cache_reserved_mb']):.4f}"
+        savings_mb = float(paged_metrics["total_kv_cache_mb"]) - float(
+            result.metrics["kv_cache_output_mb"]
+        )
+        row["zero_kv_cache_savings_mb"] = f"{savings_mb:.4f}"
         row["notes"] += (
             f";paged_kv_elapsed_ms={float(paged_metrics['elapsed_ms']):.4f};"
             f"paged_kv_blocks={paged_metrics['paged_kv_blocks']};"
             f"paged_kv_required_blocks={paged_metrics['paged_kv_required_blocks']};"
             f"paged_kv_block_size={paged_metrics['paged_kv_block_size']};"
             f"paged_kv_dtype={paged_metrics['kv_cache_dtype']};"
-            f"paged_kv_use_cache_passed={paged_metrics['use_cache_passed']}"
+            f"paged_kv_use_cache_passed={paged_metrics['use_cache_passed']};"
+            f"paged_kv_model_cache_mb={float(paged_metrics['model_kv_cache_output_mb']):.4f};"
+            f"paged_kv_total_cache_mb={float(paged_metrics['total_kv_cache_mb']):.4f}"
         )
         correctness = _paged_kv_correctness_notes(result, paged_result)
         if correctness:
@@ -302,6 +339,8 @@ def _paged_kv_row(
         "peak_allocated_mb": f"{float(peak_allocated):.4f}" if peak_allocated != "" else "",
         "peak_reserved_mb": f"{float(peak_reserved):.4f}" if peak_reserved != "" else "",
         "paged_kv_baseline_mb": f"{float(metrics['paged_kv_cache_reserved_mb']):.4f}",
+        "kv_cache_output_mb": f"{float(metrics['model_kv_cache_output_mb']):.4f}",
+        "zero_kv_cache_savings_mb": "",
         "status": "pass",
         "notes": (
             f"baseline_kind={metrics['baseline_kind']};"
@@ -314,6 +353,8 @@ def _paged_kv_row(
             f"paged_kv_blocks={metrics['paged_kv_blocks']};"
             f"paged_kv_required_blocks={metrics['paged_kv_required_blocks']};"
             f"paged_kv_dtype={metrics['kv_cache_dtype']};"
+            f"model_kv_cache_output_present={metrics['model_kv_cache_output_present']};"
+            f"total_kv_cache_mb={float(metrics['total_kv_cache_mb']):.4f};"
             f"hidden_dim={args.hidden_dim};vocab_size={args.vocab_size};{_environment()}"
         ),
     }
