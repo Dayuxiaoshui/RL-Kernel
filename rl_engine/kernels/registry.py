@@ -123,8 +123,8 @@ class KernelRegistry:
                 if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
                     logp_list.insert(0, OpBackend.CUDA_FUSED_LOGP_SM90)
 
-            # The fused linear-logp SM90 kernel uses WGMMA, which is Hopper-only
-            # (sm_90a) -- gate strictly on cc_major == 9, not >= 9.
+            # The fused linear-logp SM90 kernel uses TMA bulk-tensor copies built
+            # for sm_90a -- gate strictly on cc_major == 9 (Hopper), not >= 9.
             linear_logp_compiled = _EXT_AVAILABLE and hasattr(_C, "fused_linear_logp_sm90")
             if linear_logp_compiled and cc_major == 9:
                 ll_list = self._priority_map["cuda"]["linear_logp"]

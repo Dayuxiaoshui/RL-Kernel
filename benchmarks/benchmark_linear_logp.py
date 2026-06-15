@@ -25,6 +25,24 @@ from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 
+
+def _maybe_sm90_op():
+    """The Hopper TMA+MMA op, or None when unavailable (non-Hopper / not built)."""
+    import torch
+
+    from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+
+    if not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+        and _EXT_AVAILABLE
+        and hasattr(_C, "fused_linear_logp_sm90")
+    ):
+        return None
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    return FusedLinearLogpSM90Op()
+
 # (num_tokens, hidden_dim, vocab)
 DEFAULT_CONFIGS = [
     (4096, 2048, 32768),
@@ -75,51 +93,56 @@ def run_benchmark(args):
     dtype = torch.bfloat16
     native = NativeLinearLogpOp()
     triton_op = TritonLinearLogpOp()
+    sm90_op = _maybe_sm90_op()
 
-    logger.info(f"linear_logp benchmark on {device} (dtype={dtype})")
+    logger.info(
+        f"linear_logp benchmark on {device} (dtype={dtype}); "
+        f"SM90 TMA+MMA backend {'enabled' if sm90_op is not None else 'unavailable'}"
+    )
 
     rows = []
     for num_tokens, hidden_dim, vocab in args.configs:
         hidden, weight, target = _make_inputs(num_tokens, hidden_dim, vocab, device, dtype)
 
-        def native_fwd(h=hidden, w=weight):
+        def fwd(op, h=hidden, w=weight):
             with torch.no_grad():
-                native(h, w, target)
+                op(h, w, target)
 
-        def triton_fwd(h=hidden, w=weight):
-            with torch.no_grad():
-                triton_op(h, w, target)
-
-        def native_fwd_bwd():
+        def fwd_bwd(op):
             h = hidden.clone().requires_grad_(True)
             w = weight.clone().requires_grad_(True)
-            native(h, w, target).sum().backward()
+            op(h, w, target).sum().backward()
 
-        def triton_fwd_bwd():
-            h = hidden.clone().requires_grad_(True)
-            w = weight.clone().requires_grad_(True)
-            triton_op(h, w, target).sum().backward()
+        n_fwd = _time_ms(lambda: fwd(native), args.warmup, args.iters)
+        t_fwd = _time_ms(lambda: fwd(triton_op), args.warmup, args.iters)
+        n_fb = _time_ms(lambda: fwd_bwd(native), args.warmup, args.iters)
+        t_fb = _time_ms(lambda: fwd_bwd(triton_op), args.warmup, args.iters)
+        n_vram = _peak_vram_gb(lambda: fwd(native))
+        t_vram = _peak_vram_gb(lambda: fwd(triton_op))
 
-        n_fwd = _time_ms(native_fwd, args.warmup, args.iters)
-        t_fwd = _time_ms(triton_fwd, args.warmup, args.iters)
-        n_fb = _time_ms(native_fwd_bwd, args.warmup, args.iters)
-        t_fb = _time_ms(triton_fwd_bwd, args.warmup, args.iters)
-        n_vram = _peak_vram_gb(native_fwd)
-        t_vram = _peak_vram_gb(triton_fwd)
-
-        rows.append(
-            [
-                f"{num_tokens}x{hidden_dim}x{vocab}",
-                f"{n_fwd:.3f}",
-                f"{t_fwd:.3f}",
-                f"{n_fwd/t_fwd:.2f}x",
-                f"{n_fb:.3f}",
-                f"{t_fb:.3f}",
-                f"{n_fb/t_fb:.2f}x",
-                f"{n_vram*1024:.0f}",
-                f"{t_vram*1024:.0f}",
+        row = [
+            f"{num_tokens}x{hidden_dim}x{vocab}",
+            f"{n_fwd:.3f}",
+            f"{t_fwd:.3f}",
+            f"{n_fwd/t_fwd:.2f}x",
+            f"{n_fb:.3f}",
+            f"{t_fb:.3f}",
+            f"{n_fb/t_fb:.2f}x",
+            f"{n_vram*1024:.0f}",
+            f"{t_vram*1024:.0f}",
+        ]
+        if sm90_op is not None:
+            s_fwd = _time_ms(lambda: fwd(sm90_op), args.warmup, args.iters)
+            s_fb = _time_ms(lambda: fwd_bwd(sm90_op), args.warmup, args.iters)
+            s_vram = _peak_vram_gb(lambda: fwd(sm90_op))
+            row += [
+                f"{s_fwd:.3f}",
+                f"{n_fwd/s_fwd:.2f}x",
+                f"{t_fwd/s_fwd:.2f}x",
+                f"{s_fb:.3f}",
+                f"{s_vram*1024:.0f}",
             ]
-        )
+        rows.append(row)
 
     headers = [
         "shape (N x H x V)",
@@ -132,6 +155,14 @@ def run_benchmark(args):
         "native fwd MB",
         "triton fwd MB",
     ]
+    if sm90_op is not None:
+        headers += [
+            "sm90 fwd ms",
+            "sm90 vs native",
+            "sm90 vs triton",
+            "sm90 f+b ms",
+            "sm90 fwd MB",
+        ]
     print(tabulate(rows, headers=headers, tablefmt="github"))
 
 

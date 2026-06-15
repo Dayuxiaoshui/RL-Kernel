@@ -33,20 +33,33 @@ logp.sum().backward()  # gradients flow into hidden, lm_head_weight, bias
 
 | Backend | Wrapper | Status |
 | --- | --- | --- |
-| CUDA SM90 (Hopper) | `FusedLinearLogpSM90Op` | TMA + WGMMA streaming forward, online softmax in smem; chunked backward. Compiles for `sm_90a`; **numerics pending validation on an SM90 GPU.** |
+| CUDA SM90 (Hopper) | `FusedLinearLogpSM90Op` | TMA-streamed, software-pipelined tensor-core forward (`mma.sync.m16n8k16`), online softmax in smem; chunked backward. Compiles for `sm_90a`; **validated fp32-accurate on H100.** Falls back to Triton/native for fp32/fp16 inputs or hidden dims not divisible by 32. |
 | CUDA / ROCm (Triton) | `TritonLinearLogpOp` | Triton online-softmax forward; Liger-style chunked backward (cuBLAS matmuls, deterministic). Phase 1. |
 | PyTorch native | `NativeLinearLogpOp` | Naive `F.linear` + `log_softmax` + `gather` reference; CPU / Triton-less fallback. |
 
 The SM90 backend (`csrc/cuda/fused_linear_logp_sm90.cu`) streams hidden/weight
-tiles via TMA, computes each logit tile with WGMMA (`m64n64k16`), folds it into a
-per-row online softmax in shared memory, and gathers the target logit — never
+tiles via TMA (`cp.async.bulk.tensor`, mbarrier-completed, double-buffered),
+contracts each `[BM, BN]` logit tile with the warp-level tensor-core MMA path
+(`ldmatrix` + `mma.sync.m16n8k16`, fp32 accumulation), folds it into a per-row
+online softmax in shared memory, and gathers the target logit — never
 materializing `[N, V]`. It is **build-guarded**: only compiled when the extension
-is built with `KERNEL_ALIGN_FORCE_SM90=1` on an SM90 device (WGMMA is Hopper-only,
-`sm_90a`), and the registry only selects it when `cc_major == 9` and the symbol is
-present. The forward kernel requires bf16 hidden/weight; the backward reuses the
-deterministic chunked path. It assembles cleanly under CUDA 13.1 `ptxas`, but the
-layout-sensitive pieces (WGMMA descriptors, accumulator→smem mapping, B-operand
-transpose) require validation on Hopper hardware.
+is built with `KERNEL_ALIGN_FORCE_SM90=1` on an SM90 device (TMA/`sm_90a`), and
+the registry only selects it when `cc_major == 9` and the symbol is present. The
+forward kernel requires bf16 hidden/weight with `D % 32 == 0`; for any other input
+the op transparently falls back to the Triton (else native) backend. The backward
+reuses the deterministic chunked path.
+
+The forward is fp32-accurate (matches the fp32 reference to ~1e-3, and the Triton
+op's forward to ~1e-5 with bitwise-identical gradients) and **throughput-tuned**:
+it runs at **~2× the Triton online-softmax forward** on H100 (bf16, N=4096,
+D=2048) across `V ∈ {32768, 50257, 131072}`, while keeping the zero-`[N,V]`
+headline — peak forward memory is the per-CTA shared-memory tiles, independent of
+`V`. Two design choices get it there: **register-blocked M-tiling** (`BM = 256`
+rows/CTA, so the weight matrix is re-read only `N/BM` times from HBM) and
+**split-V** (the vocab loop is partitioned across `blockIdx.y` so the grid fills
+all SMs, each split emitting a partial online-softmax state that a tiny combine
+kernel merges). Remaining headroom: a register-resident softmax epilogue (drop the
+`[BM,BN]` smem logit round-trip) and warp-specialized TMA producers.
 
 The backward chunks over the token dimension: for each chunk it materializes only
 `[chunk, V]` logits, recomputes the softmax from scratch, and forms the three

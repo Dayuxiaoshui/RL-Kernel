@@ -14,6 +14,33 @@ from rl_engine.utils.logger import logger
 # at ~chunk*V instead of N*V.
 _BWD_CHUNK_ELEMS = 1 << 24
 
+# Hidden-dim slice the SM90 forward streams per TMA load; D must be a multiple of
+# it (mirrors `constexpr int BK` in csrc/cuda/fused_linear_logp_sm90.cu).
+_SM90_BK = 32
+
+
+def _sm90_supported(hidden: torch.Tensor, lm_head_weight: torch.Tensor) -> bool:
+    """Whether the bf16 TMA+MMA forward can run these inputs directly."""
+    return (
+        hidden.is_cuda
+        and hidden.dtype == torch.bfloat16
+        and lm_head_weight.dtype == torch.bfloat16
+        and hidden.size(-1) % _SM90_BK == 0
+    )
+
+
+def _fallback_op():
+    """Portable op for inputs the SM90 forward cannot take (fp32/fp16, or a hidden
+    dim not divisible by the kernel's K slice). Prefers Triton, else native."""
+    try:
+        from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
+
+        return TritonLinearLogpOp()
+    except Exception:  # pragma: no cover - Triton missing
+        from rl_engine.kernels.ops.pytorch.loss.linear_logp import NativeLinearLogpOp
+
+        return NativeLinearLogpOp()
+
 
 class _FusedLinearLogpSM90Function(torch.autograd.Function):
     """SM90 TMA+WGMMA fused forward + Liger-style chunked backward.
@@ -108,13 +135,14 @@ class FusedLinearLogpSM90Op:
         target_ids: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not hidden.is_cuda:
-            raise RuntimeError("FusedLinearLogpSM90Op requires CUDA tensors.")
-        if hidden.dtype != torch.bfloat16 or lm_head_weight.dtype != torch.bfloat16:
-            raise RuntimeError("FusedLinearLogpSM90Op requires bfloat16 hidden/weight.")
         if lm_head_weight.size(-1) != hidden.size(-1):
             raise ValueError(
                 f"hidden dim {hidden.size(-1)} must match lm_head_weight dim "
                 f"{lm_head_weight.size(-1)}"
             )
+        # The compiled forward is bf16-only and needs D % BK == 0. For anything
+        # else (fp32/fp16 references, awkward hidden dims, CPU tensors) fall back
+        # to a portable backend so the op stays a drop-in for any input.
+        if not _sm90_supported(hidden, lm_head_weight):
+            return _fallback_op()(hidden, lm_head_weight, target_ids, bias)
         return _FusedLinearLogpSM90Function.apply(hidden, lm_head_weight, bias, target_ids)
