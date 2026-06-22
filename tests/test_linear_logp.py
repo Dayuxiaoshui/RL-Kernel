@@ -302,6 +302,29 @@ def test_sm90_rejects_bad_target_and_bias():
         sm90(hidden, weight, target, bias.cpu())
 
 
+@requires_sm90
+def test_sm90_rejects_out_of_range_target():
+    # Padding (-100) / out-of-vocab ids must error, not silently corrupt fwd/bwd.
+    from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+    sm90 = FusedLinearLogpSM90Op()
+    hidden, weight, target, bias = _sm90_inputs(18)
+
+    pad = target.clone()
+    pad[0] = -100  # typical ignore_index
+    with pytest.raises(ValueError):
+        sm90(hidden, weight, pad, bias)
+
+    oob = target.clone()
+    oob[1] = _SM90_V  # == V, one past the last valid id
+    with pytest.raises(ValueError):
+        sm90(hidden, weight, oob, bias)
+
+    # A valid target (all in [0, V)) still works.
+    out = sm90(hidden, weight, target, bias)
+    assert out.shape == target.shape and torch.isfinite(out).all()
+
+
 def test_registry_dispatch_matches_native():
     from rl_engine.kernels.registry import kernel_registry
     from rl_engine.platforms.device import device_ctx

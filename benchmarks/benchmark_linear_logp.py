@@ -87,8 +87,8 @@ def _peak_vram_gb(fn, warmup=3, iters=5):
 
 
 def run_benchmark(args):
-    if device_ctx.device_type != "cuda":
-        raise RuntimeError("linear_logp benchmark requires a CUDA device (Triton op is CUDA-only).")
+    if device_ctx.device_type not in ["cuda", "xpu", "hip"]:
+        raise RuntimeError("linear_logp benchmark requires a compatible GPU device.")
 
     device = device_ctx.device
     dtype = torch.bfloat16

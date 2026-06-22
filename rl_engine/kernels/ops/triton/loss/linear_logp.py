@@ -8,14 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
+from rl_engine.kernels.ops.pytorch.loss.linear_logp import chunked_linear_logp_backward
+
 # Token / vocab / hidden tile sizes (forward Triton kernel).
 _BLOCK_N = 32
 _BLOCK_V = 64
 _BLOCK_D = 64
-
-# Backward token-chunk size target: process at most this many [chunk, V] logit
-# elements per cuBLAS step so peak backward memory stays ~chunk*V, not N*V.
-_BWD_CHUNK_ELEMS = 1 << 24
 
 
 @triton.jit
@@ -136,44 +134,18 @@ class _LinearLogpFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_logp):
         hidden_2d, weight, bias_t, target_1d, _lse = ctx.saved_tensors
-        n, d = hidden_2d.shape
-        v = weight.shape[0]
-        dt = weight.dtype
-        g = grad_logp.reshape(-1).to(torch.float32)
-
-        grad_h = torch.empty_like(hidden_2d, dtype=torch.float32)
-        grad_w = torch.zeros(v, d, device=weight.device, dtype=torch.float32)
-        grad_b = torch.zeros(v, device=weight.device, dtype=torch.float32) if ctx.has_bias else None
-
-        # Liger-style chunked materialization: process at most `chunk` tokens at a
-        # time, materializing only [chunk, V] logits. The projections use cuBLAS
-        # matmuls (tensor cores for bf16/fp16), and grad_weight is accumulated in
-        # sequential loop order -> deterministic and atomic-free. Peak extra
-        # memory is chunk*V instead of N*V.
-        chunk = max(1, min(n, _BWD_CHUNK_ELEMS // v))
-        for i0 in range(0, n, chunk):
-            i1 = min(i0 + chunk, n)
-            x = hidden_2d[i0:i1]  # [C, D]
-            logits = torch.matmul(x, weight.t())  # [C, V]
-            if ctx.has_bias:
-                logits = logits + bias_t
-
-            # dz = g * (onehot - softmax(logits)), recomputed from scratch so it
-            # is self-normalizing and independent of the forward's saved lse.
-            dz = torch.softmax(logits.float(), dim=-1).neg_()  # [C, V] fp32
-            rows = torch.arange(i1 - i0, device=dz.device)
-            dz[rows, target_1d[i0:i1].long()] += 1.0
-            dz *= g[i0:i1].unsqueeze(1)
-
-            dz_dt = dz.to(dt)
-            grad_h[i0:i1] = torch.matmul(dz_dt, weight).float()  # [C, D]
-            grad_w += torch.matmul(dz_dt.t(), x).float()  # [V, D]
-            if ctx.has_bias:
-                grad_b += dz.sum(0)
-
-        grad_hidden = grad_h.to(ctx.hidden_dtype).reshape(ctx.lead_shape + (d,))
-        grad_weight = grad_w.to(ctx.weight_dtype)
-        grad_bias = grad_b.to(ctx.bias_dtype) if ctx.has_bias else None
+        grad_hidden, grad_weight, grad_bias = chunked_linear_logp_backward(
+            grad_logp,
+            hidden_2d,
+            weight,
+            target_1d,
+            bias_t,
+            has_bias=ctx.has_bias,
+            lead_shape=ctx.lead_shape,
+            hidden_dtype=ctx.hidden_dtype,
+            weight_dtype=ctx.weight_dtype,
+            bias_dtype=ctx.bias_dtype,
+        )
         # Inputs: hidden, lm_head_weight, bias, target_ids.
         return grad_hidden, grad_weight, grad_bias, None
 
@@ -203,8 +175,11 @@ class TritonLinearLogpOp:
         target_ids: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not hidden.is_cuda:
-            raise RuntimeError("TritonLinearLogpOp requires CUDA tensors.")
+        if hidden.device.type not in ("cuda", "xpu", "hip"):
+            raise RuntimeError(
+                "TritonLinearLogpOp requires a GPU tensor (CUDA / ROCm / XPU), got "
+                f"device '{hidden.device}'."
+            )
         if hidden.shape[:-1] != target_ids.shape:
             raise ValueError(
                 f"hidden leading shape {tuple(hidden.shape[:-1])} must match "
@@ -214,5 +189,12 @@ class TritonLinearLogpOp:
             raise ValueError(
                 f"hidden dim {hidden.size(-1)} must match lm_head_weight dim "
                 f"{lm_head_weight.size(-1)}"
+            )
+        vocab = lm_head_weight.size(0)
+        if bool(((target_ids < 0) | (target_ids >= vocab)).any()):
+            t_min, t_max = int(target_ids.min()), int(target_ids.max())
+            raise ValueError(
+                f"target_ids out of range: expected [0, {vocab - 1}], got [{t_min}, {t_max}]. "
+                "Mask or filter padding / ignore-index values (e.g. -100) before this op."
             )
         return _LinearLogpFunction.apply(hidden, lm_head_weight, bias, target_ids)
