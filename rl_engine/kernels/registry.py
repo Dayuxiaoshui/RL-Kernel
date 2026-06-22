@@ -39,6 +39,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
     PYTORCH_GRPO_LOSS = "rl_engine.kernels.ops.pytorch.loss.grpo_loss.NativeGRPOLossOp"
 
+    # Fused linear log-prob (hidden @ W^T -> selected-token logp, no [N, V] logits)
+    CUDA_FUSED_LINEAR_LOGP_SM90 = (
+        "rl_engine.kernels.ops.cuda.loss.linear_logp.FusedLinearLogpSM90Op"
+    )
+    TRITON_LINEAR_LOGP = "rl_engine.kernels.ops.triton.loss.linear_logp.TritonLinearLogpOp"
+    PYTORCH_LINEAR_LOGP = "rl_engine.kernels.ops.pytorch.loss.linear_logp.NativeLinearLogpOp"
     # Fused policy-ratio + KL-penalty front-end (PPO/GRPO), logits -> (ratio, kl)
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
@@ -81,6 +87,7 @@ class KernelRegistry:
                 ],
                 "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
+                "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 # Default dispatch logic for new operators
             },
@@ -92,12 +99,14 @@ class KernelRegistry:
                     OpBackend.TRITON_GENERIC,
                 ],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
+                "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
             },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
+                "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
             },
         }
@@ -147,6 +156,14 @@ class KernelRegistry:
                 logp_list = self._priority_map["cuda"]["logp"]
                 if OpBackend.CUDA_FUSED_LOGP_SM90 not in logp_list:
                     logp_list.insert(0, OpBackend.CUDA_FUSED_LOGP_SM90)
+
+            # The fused linear-logp SM90 kernel uses TMA bulk-tensor copies built
+            # for sm_90a -- gate strictly on cc_major == 9 (Hopper), not >= 9.
+            linear_logp_compiled = _EXT_AVAILABLE and hasattr(_C, "fused_linear_logp_sm90")
+            if linear_logp_compiled and cc_major == 9:
+                ll_list = self._priority_map["cuda"]["linear_logp"]
+                if OpBackend.CUDA_FUSED_LINEAR_LOGP_SM90 not in ll_list:
+                    ll_list.insert(0, OpBackend.CUDA_FUSED_LINEAR_LOGP_SM90)
             elif cc >= 90:
                 logger.debug(
                     f"SM{cc}: fused TMA LogP kernel not compiled into _C; "
